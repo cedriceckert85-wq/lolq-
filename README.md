@@ -1,86 +1,653 @@
-What is lolQ?
-lolQ is a desktop companion application for League of Legends, built in Python (FastAPI sidecar), Rust (Tauri runtime), and SolidJS (frontend). It runs entirely on the user's local machine, requires no account login beyond Riot's standard OAuth-equivalent (the LCU lockfile), and stores zero user data on remote servers.
-The app's purpose is to give the user better-than-static build recommendations during champion select. Where existing tools (u.gg, op.gg, lolalytics, mobalytics) offer a one-size-fits-all "recommended build" per champion-and-role, lolQ analyzes the actual enemy team composition being assembled in real time and adjusts item-build, rune, and summoner-spell suggestions accordingly. The system uses a three-layer recommender architecture (Wilson lower-bound baseline, heuristic adaptive rules, statistical comp-slicing) that escalates in sophistication as more match data is collected.
-This document describes the system in the state it will reach after completion of Phase 12 — the statistical comp-slicing layer that turns ~200,000 collected Master+ EUW matches into composition-aware recommendations. The app is functional and useful at earlier phases (Phases 9 and 10 ship working recommenders); Phase 12 represents the maturity point where lolQ's core differentiator (true comp-awareness) is fully data-driven rather than rule-based.
+# lolQ
 
-What the application does, from the user's perspective
-A player launches lolQ alongside the League Client. The application's tray icon turns green when it detects the LCU lockfile (League's local API surface) and establishes a websocket subscription to champion-select events. The user has previously logged in once to their Riot account in the app to register their PUUID; this is stored locally in the Windows Credential Manager via Python's keyring library.
-When the player enters a champion select lobby, the app's main window — a small panel that snaps to the side of the screen at ~450 pixels wide — populates progressively as picks happen. Each time a pick is locked in by an ally or enemy, the app:
+**A locally-running League of Legends companion app with composition-aware build recommendations.**
 
-Re-reads the LCU /lol-champ-select/v1/session endpoint to update its internal model of the lobby state (all 10 players, their champion IDs, their assigned positions, their summoner names if available).
-Classifies the enemy team into an archetype bucket using a k-modes-derived clustering of four discrete features: tank count, AP count, ranged count, and hard-CC score. This produces one of ~8 cluster IDs.
-Looks up the player's own champion + assigned lane + the enemy archetype in a precomputed parquet file (builds_by_archetype.parquet) and retrieves the Bayesian-smoothed item build with the highest Wilson lower bound for that exact cell.
-If the cell has fewer than 50 matches (sparse), the system falls back hierarchically: first to (champion, lane, *) — ignoring enemy comp — and then to a heuristic rule overlay (Phase 11 layer) that promotes/demotes items based on hand-curated counter-build rules.
-Renders the result in the panel: a left column showing the recommended starting items, boots, three core items, and two situational items; a right column showing the recommended full rune page (two trees, three primary runes, two sub runes, three stat shards); and a small badge at the top labeled with the detected comp archetype (e.g., "vs 2 Tanks + 2 AP") so the user understands why the build differs from the standard recommendation.
+> Written for the Riot Games Developer Application — `README.md`
 
-The user can click "Apply Runes" to write the recommended rune page directly into the League Client. This is implemented by a sequence of LCU calls — POST /lol-perks/v1/pages with the assembled selectedPerkIds array, optionally preceded by DELETE /lol-perks/v1/pages/{id} for old lolQ:-prefixed pages to free a page slot if the user has hit their League rune-page limit. The "Apply Spells" button does the same for summoner spells, hitting PATCH /lol-champ-select/v1/session/my-selection with the spell1Id and spell2Id fields. The user can also click any individual rune or stat shard to override the suggestion before applying; the panel re-validates the selection against the runes_database.json schema (which the app generated from Data Dragon) to make sure the page is well-formed before sending it to the client.
-When the user has multiple Riot accounts (a common scenario for ranked players who maintain a main account and one or more smurfs), they can switch between them via a quick-access panel — keyboard shortcuts 1 through 9 trigger an account switch that closes the League Client cleanly, edits the Riot Client's RiotClientInstalls.json to point to the selected account's stored credentials, and relaunches. The app then re-attaches its LCU watchdog to the freshly started client. Account credentials are stored encrypted in the Windows Credential Manager, never in plain-text files.
-Independent of any active game, the user has a "stats dashboard" available in a second route of the app. This dashboard reads from the player's own match history (sourced via /lol/match/v5/matches/by-puuid/{puuid}/ids plus per-match detail fetches) and shows per-champion win rate, KDA distribution, build history, and lane assignment patterns. The dashboard refreshes on a configurable interval (default: poll the /lol/match/v5 endpoints every 5 minutes when the user is not in-game) so that the user's results from just-completed games appear automatically.
-In a third route, the user can manually browse build recommendations for any champion-and-role combination, without being in a champ select. This is the "research mode" — useful for planning ahead before queueing into a game, or for studying how lolQ's recommended build for a specific matchup differs from popular alternatives. Each item, rune, and spell in the panel is hover-annotated with its sample size and confidence interval, so the user can see at a glance whether the recommendation is based on hundreds of matches (high confidence) or a few dozen (use with judgment).
+---
 
-How the application gets its data
-The collector
-lolQ's data foundation is a personal-use collector that runs in the background as a FastAPI subprocess (a "sidecar" launched by the Tauri host). It uses the user's own Riot Developer API key (production tier, granted by Riot's standard application process) and pulls anonymized match data from the EUW1 Master+ tier on a schedule controlled by the user via the in-app settings panel.
-The collector's job is to grow the local parquet store from zero to ~200,000 matches over the course of weeks or months of background operation. It does this in three phases per cycle:
+## Table of Contents
 
-PUUID discovery: it calls the three league-v4 endpoints (/lol/league/v4/challengerleagues/by-queue/RANKED_SOLO_5x5, /lol/league/v4/grandmasterleagues/by-queue/RANKED_SOLO_5x5, /lol/league/v4/masterleagues/by-queue/RANKED_SOLO_5x5) against https://euw1.api.riotgames.com to harvest the puuid of every player currently in the top tiers. Following Riot's 2024 schema migration, LeagueItemDTO now includes puuid directly, eliminating the older summonerId → summoner-v4 → puuid round-trip and reducing PUUID-discovery cost from O(N) calls to exactly three.
-Match-ID enumeration per PUUID: for each harvested puuid, it calls /lol/match/v5/matches/by-puuid/{puuid}/ids?queue=420&type=ranked&count=100&start=0..900 to enumerate up to 1,000 recent ranked-solo match IDs per player. The start parameter is capped at ~1,000 by Riot, so this is the practical depth limit for any individual player's history.
-Match-detail fetch: it deduplicates the harvested match IDs against the existing parquet store (a DuckDB-backed seen-set built at process startup from the existing match parquets, then maintained in-memory) and fetches the full match document for each new ID via /lol/match/v5/matches/{matchId} on https://europe.api.riotgames.com. Each match document is parsed into a flat participant-row format (one row per player per match, ten rows per match) and appended to a date-partitioned parquet file in data/matches/.
+- [Overview](#overview)
+- [The Problem lolQ Solves](#the-problem-lolq-solves)
+- [About Me](#about-me)
+- [Features](#features)
+- [Architecture](#architecture)
+- [Data Pipeline](#data-pipeline)
+- [The Recommender Stack](#the-recommender-stack)
+- [Riot API Usage](#riot-api-usage)
+- [Compliance & Developer Policies](#compliance--developer-policies)
+- [Technical Stack](#technical-stack)
+- [Project State & Roadmap](#project-state--roadmap)
+- [Why I Need a Production API Key](#why-i-need-a-production-api-key)
 
-The collector respects Riot's rate limits at the implementation level rather than guessing. It reads the X-App-Rate-Limit, X-App-Rate-Limit-Count, X-Method-Rate-Limit, and X-Method-Rate-Limit-Count headers on every response and feeds them into a per-(host, method) RiotLimiter class that uses a fixed-window counter algorithm matching Riot's documented behavior. Burst is allowed up to 95% of the published quota; the 5% headroom absorbs the documented jitter at window boundaries (developer-relations Issue #371). On a 429 response, it parses the Retry-After header (integer seconds) and the X-Rate-Limit-Type discriminator (application / method / service) to decide which counter to wait on, then sleeps for exactly the value of Retry-After plus 100-500ms of jitter. It does not stack exponential backoff on top of Retry-After for application or method 429s; Riot's value is authoritative and adding backoff just wastes budget. Exponential backoff is reserved for 500/502/503/504 responses where Riot has not given an explicit recovery hint.
-Two separate RiotLimiter instances are maintained: one for euw1.api.riotgames.com (used by league-v4 calls during PUUID discovery) and one for europe.api.riotgames.com (used by match-v5 calls during match enumeration and detail fetch). These are independent buckets per Riot's documented per-region enforcement, which means PUUID discovery and match fetching can run concurrently without competing for the same 500-requests-per-10-seconds application limit. In practice this lets the collector saturate the European routing pool at ~45-48 requests per second sustained while keeping the EUW1 platform pool largely idle except during the brief PUUID-discovery phase at the start of each cycle.
-The collector uses a single long-lived httpx.AsyncClient (not one per request) with httpx.Limits(max_connections=50, max_keepalive_connections=25, keepalive_expiry=30.0) to keep TLS warm and avoid the per-call handshake overhead that bottlenecks naive collector implementations. Concurrency is bounded by an asyncio.Semaphore sized to roughly rate × latency = 50 req/s × 0.2 s = ~10-25 in-flight requests, which has empirically proven sufficient to saturate the 500/10s cap on a single endpoint. Higher concurrency (~50) is occasionally configured for catch-up workloads (e.g., when the user has had the app closed for a week and the collector is filling in backlog) but offers no throughput improvement over ~25 in steady state.
-An optional second collector: OTP-targeted harvesting
-For champions that are rarely picked in the general Master+ population (e.g., Bard, Aurelion Sol, Ivern, Mel, Briar before they were established in the meta), the random-sampling collector would take months to accumulate enough games for stable per-comp recommendations. lolQ includes a second, opt-in collector that targets specific "one-trick pony" players whose match histories are dense in a single champion.
-The user provides a small list of Riot IDs (gameName#tagLine format) for known high-elo OTPs of the target champion — typically discovered manually via lolpros.gg, op.gg leaderboards filtered by champion, or community Discord recommendations. The OTP collector resolves each Riot ID to a puuid via /riot/account/v1/accounts/by-riot-id/{gameName}/{tagLine} on the regional routing host (necessary because summoner-v4/by-name was deprecated during Riot's 2023-2024 Riot ID migration), then performs the same per-puuid match enumeration as the general collector — but instead of accepting all returned matches, it filters client-side to keep only those where the OTP played the target champion. A Bard OTP with 1,000 matches in their history at 80% Bard pick rate yields roughly 800 Bard games in a single 10-minute run; five such OTPs yield ~4,000-5,000 high-density Bard matches, an order of magnitude more than the random collector would gather for that champion in a comparable budget.
-OTP-collected matches are written to a separate path (data/matches/otp_curated/<champion_key>/) with three additional columns (data_source = "otp_curated", source_puuid, otp_riot_id) so the recommender can choose whether to mix or separate them. The default Phase 12 recommender treats OTP-curated matches as a distinct candidate pool and only falls back to them when the random-sampled cell for a given (champion, lane, archetype) has fewer than 30 matches. This separation matters because OTP players are systematically better at their main champion than the average Master+ player; mixing the two pools without weighting would inflate the apparent skill ceiling of the champion in the aggregated win rate. The architecture preserves the option to apply skill-balanced weighting in a later phase (Phase 13 ML layer, described below) without re-collecting any data.
-The aggregator
-Once data is on disk in parquet form, it is processed by a DuckDB-based aggregator pipeline that runs either on the collector's completion signal or on a cron-style schedule. The aggregator produces seven output parquets:
+---
 
-champion_winrate.parquet — overall win rate per (champion, role, tier, patch) with sample size and Wilson lower bound
-item_winrate.parquet — per-item win rate per (champion, role, item_id) — added in Phase 10.7 to fix the kombinatorial sparsity of the earlier item_build_winrate table, which keyed on full 6-item tuples and had near-zero rows for most champions
-rune_winrate.parquet — per-rune win rate per (champion, role, rune_id, slot_position), added in Phase 10A together with the parser extension that captures all nine perk fields (keystone, three primary runes, two sub runes, three stat shards) from each match
-summoner_spell_winrate.parquet — per-(spell1, spell2) win rate per (champion, role), with a special low-sample-size flag for unusual combinations
-matchup_table.parquet — per-(champion, role, opponent_champion) win rate, used for the 1v1 lane matchup display in the research route
-build_transitions.parquet — sequential item-purchase probabilities (a Markov model over item orders), used to render the order of the recommended build rather than just the set
-builds_by_archetype.parquet — the Phase 12 artifact: per-(champion, role, comp_archetype, item_slot, item_id) win rate, smoothed and indexed for O(1) lookup at champ-select time
+## Overview
 
-Every win-rate cell across these tables is stored both as a raw fraction (wins / games) and as a Bayesian-smoothed estimate. The smoothing uses an empirical-Bayes Beta prior fit per champion: the prior mean is the global (champion, lane) win rate, and the prior strength α + β is set to 50 effective games. This is implemented as a closed-form Laplace-style smoothing — wr_smoothed = (wins + α) / (games + α + β) — chosen over a hierarchical PyMC model for runtime performance (the aggregator must complete in seconds, not minutes) and because the closed form is sufficient for the smoothing degree needed here. The Wilson lower bound at the 95% confidence level is also computed per cell and stored alongside the point estimate; the recommender ranks by Wilson lower bound rather than by raw or smoothed win rate, which provides intrinsic protection against high-variance recommendations from small samples.
-The recommender stack
-Recommendation is layered. At the bottom is the Phase 9 Wilson-ranked recommender that simply returns the highest-LB build per (champion, role) — a deterministic, fully interpretable baseline that produces sensible output even at zero collected matches (where it returns hand-curated overrides loaded from assets/data/item_sets/*.json).
-On top of that sits the Phase 11 heuristic adaptive layer. This is a rules engine that reads from a single declarative rules.toml file containing 30-60 hand-curated conditions and consequences. Each rule specifies a trigger predicate over the enemy comp (e.g., enemy_tags_count(['Tank']) >= 2), a list of item IDs to promote or demote, a priority shift, and a weight. At recommendation time, the engine evaluates every rule against the current enemy comp, applies the score modifications to the Phase 9 base build, and re-ranks. Every triggered rule is also returned in the API response so the frontend can render a small "why" tooltip on each modified item — a critical interpretability property that distinguishes lolQ from black-box ML recommenders. The rule library is small, version-controlled, and trivially patch-update-able: when Riot ships a balance patch that, say, weakens Heartsteel, the user (or community contributors via the lolQ git repo) can edit one TOML entry rather than waiting for an ML model to retrain.
-On top of the heuristic layer sits the Phase 12 statistical comp-slicing layer, which is the architectural focal point of this README. Phase 12 replaces the rule-based item modifications with data-driven ones for any (champion, role, archetype) cell that has at least 50 matches in builds_by_archetype.parquet. For sparse cells — newly released champions, off-meta picks, unusual comps — the Phase 11 heuristics remain active as a fallback. This hierarchical fallback (statistical → heuristic → static) means the user never sees a "no data" state: every champ-select gets some recommendation, with the underlying mechanism transparently indicated by a small badge in the UI ("data-driven" / "heuristic" / "baseline").
-The comp-archetype encoder that drives Phase 12 is itself learned from the data, not hand-tuned. At each aggregator run, the encoder takes a 4-dimensional discrete feature vector per match — (tank_count, ap_count, ranged_count, cc_score) — and applies k-modes clustering (a categorical-data variant of k-means, well-suited to discrete features and resistant to the curse of dimensionality at this scale) to bin the empirical distribution of enemy comps into ~6-12 cluster IDs. Clusters are stable across aggregator runs: the encoder persists the cluster centroids in a small JSON file and assigns new matches to the nearest existing cluster rather than re-clustering from scratch each time. This stability matters because it lets the recommender's "vs 2 Tanks + 2 AP" badge mean the same thing on patch 14.5 as it does on patch 14.20; the categorical buckets are decoupled from the per-patch champion balance fluctuations.
+lolQ is a desktop companion application for League of Legends that gives players **composition-aware build recommendations** during champion select. Unlike existing tools (u.gg, op.gg, lolalytics, mobalytics) which show a one-size-fits-all build per champion-and-role, lolQ analyzes the actual enemy team composition in real time and adjusts item, rune, and summoner-spell suggestions accordingly.
 
-Why lolQ exists and what its competitive position is
-The motivation for building lolQ is personal. I have 11 friends who started playing League of Legends recently. When they began consulting the existing community build sites — u.gg, op.gg, lolalytics — to figure out what items to buy on a given champion, they ran into a problem that experienced players don't always notice: the recommended builds these sites display are averaged across all matchups, which means the suggestion ignores who the player is actually fighting against. The most common failure mode my friends hit was tank champions: the standard u.gg build for a tank like Ornn, Malphite, or Sion shows a full-armor stack (Sunfire Aegis, Thornmail, Frozen Heart, Randuin's Omen) because the dataset-average matchup has more physical damage than magic damage on the enemy team. When a new player follows that build into a game where the enemy team is, say, three AP threats and two squishy carries, the result is a tank with 350 armor and 60 magic resist getting deleted by a Syndra ultimate or a Veigar combo — and the player has no idea why, because the build site told them this was the recommended build.
-This is a fixable problem, and it's the specific problem lolQ exists to solve. By making enemy team composition a first-class input to the recommender, the app produces builds that fit the actual matchup: armor items get demoted when the enemy team is AP-heavy, magic resist items get promoted, and the player sees a visible badge in the UI ("vs 3+ AP") explaining why the recommendation differs from the static u.gg version. For my friends, this turns a frustrating "the build site lied to me" moment into a transparent "the build adjusted because the enemy team is mostly mages" — which is both more useful in the moment and educational over time. They are the first real users of the app outside of me, and the design priorities (interpretability badges on every modified item, fallback to safe standard builds when data is sparse, no required account login, runs locally with no signup) reflect their needs as much as my own.
-I am also a Grandmaster-tier ranked Solo/Duo player on EUW myself, which shapes how I plan to maintain the recommender over time. The statistical layer (Phase 12) does most of the work automatically — when a patch lands and item balance shifts, the aggregator re-runs and the per-archetype builds update themselves from the new match data within a few collector cycles. But statistics alone cannot capture everything. Some build choices are correct only for specific player skill levels, only in specific matchups, or only when the player understands a nuance the dataset cannot see — for example, when a Lethality first-item is correct on Talon into a squishy comp at high elo because the player will reliably hit their roams, but wrong at lower elo where the same player will not convert the early lead. These nuances live in the hand-curated overrides — JSON files under assets/data/item_sets/, rune_sets/, and spell_sets/ that the aggregator deliberately leaves untouched when the file's source field is anything other than auto_from_aggregator. My intention is to spend time over the months and patches following Phase 12's release auditing the auto-generated builds for the champions I actively play, comparing them against what I know from my own ranked games and from watching high-elo VODs, and writing manual overrides where the data-driven build is suboptimal in a way the aggregator cannot detect. This is a continuous, indefinite maintenance loop — League's meta shifts every two weeks, and the app's quality depends on a human in the loop who actually plays the game at the level the dataset represents.
-lolQ's central design choice is that the enemy team composition should be a first-class input to item, rune, and spell recommendations. None of the major existing tools — u.gg, op.gg, lolalytics, mobalytics, blitz.gg, probuilds.net — provide this. Their public APIs expose at most a one-dimensional "vs Champion X" filter (a single lane opponent), not a five-enemy team-composition filter. This is verifiable from their public documentation and from their endpoint behavior: u.gg's recommended-build endpoint accepts lane, rank, region, and patch parameters but no enemy-team filter; lolalytics' matchup endpoint is strictly pairwise; mobalytics, blitz, and probuilds follow the same pattern.
-The reason none of them do this is not technical — they have orders of magnitude more match data than lolQ ever will — but architectural. Their tools serve millions of players across all ranks, where the long tail of comp combinations would produce thin per-cell data even at their scale. lolQ's scope is narrower: a single user, Master+ only, with a deliberate willingness to fall back to less-specific buckets when the most-specific cell is sparse. This narrower scope is what makes per-comp recommendations tractable.
-The application is also locally hosted, ad-free, and has no remote backend. The user's match history, account list, and any custom rune pages they apply are stored in the user's local filesystem and Windows Credential Manager. The app communicates with two services and only two: the user's own League Client (via the localhost LCU on 127.0.0.1:<port>) and Riot's public Developer API (via TLS to *.api.riotgames.com). There is no telemetry, no analytics, no third-party SDK. This is a design property, not a feature: it means the app is usable indefinitely without any operational cost to the user or to a hosting provider, and it means a single API-key-related security incident is contained to the user's own machine rather than affecting a population of users.
+### Key Properties
 
-How lolQ relates to Riot's developer policies
-Several aspects of the app are sensitive enough to warrant explicit discussion.
-LCU writes. The app writes to the LCU's /lol-perks/v1/pages endpoint (for rune-page application) and /lol-champ-select/v1/session/my-selection endpoint (for summoner-spell setting). These are documented LCU endpoints used by mainstream tools (Mobalytics, Blitz, OP.GG Desktop, Porofessor) for the same purpose without enforcement action over multiple years. The app's writes are user-initiated — they happen only when the user clicks an "Apply" button, never automatically — and they are reversible (the user can restore their previous rune page manually or via the "Cleanup lolQ pages" function). All pages created by the app are prefixed with lolQ: in their name field so the user can identify and audit them. The app does not modify any other LCU resource (no friend-list, no match-history, no chat, no in-game state).
-No third-party-data collection. The collector pulls exclusively from Riot's public Developer API. It does not scrape u.gg, lolalytics, op.gg, or any other community site. It does not use the internal League Client memory layout, packet inspection, or any other mechanism that would constitute reverse-engineering the game client.
-No competitive integrity issues. The app is a champ-select-only tool. It does not provide any in-game overlay, no minimap awareness, no enemy-cooldown tracking, no DPS calculator, no item-counter highlighting during the live game. The Live-Client-Data API on port 2999 (which provides in-game data during matches) is not currently used by the app and not planned for future use. The app strictly augments the pre-game decision phase, where Riot has historically allowed considerable third-party tooling latitude.
-Rate-limit respect. The collector's rate-limiter is implementation-correct (header-driven, not hardcoded), runs at ≤95% of the per-key quota, and never attempts to use multiple API keys or accounts to evade limits. The app refuses to start the collector if the user's API key is not provided or if a 401/403 response indicates the key has been revoked.
-Data freshness and patch handling. The aggregator regenerates all its outputs whenever a new patch ships (detected via the gameVersion field on match documents). Pre-patch data is retained on disk but tagged with the patch it was collected under; the recommender shows only current-patch data by default with a UI toggle to include older patches. This avoids the failure mode where stale item-balance changes corrupt active recommendations.
-Account-switcher safety. The multi-account quick-switch feature stores credentials in the Windows Credential Manager (the standard Windows-native secret store), never in plain-text files. The feature uses Riot's own RiotClientInstalls.json mechanism for account selection rather than scripting the login dialog or storing session tokens. The feature does not facilitate account sharing, account selling, or any form of account compromise; it is a quality-of-life feature for users who already legitimately own multiple accounts.
+| Property | Value |
+|---|---|
+| **Platform** | Windows (Tauri 2.x) |
+| **Architecture** | Local-first, no remote backend |
+| **Data Storage** | Local filesystem (parquet + JSON) |
+| **Telemetry** | None |
+| **Third-party SDKs** | None |
+| **Account Login** | LCU lockfile only (Riot's local API) |
+| **Distribution** | Personal-use, ~12 users (myself + 11 friends) |
+| **Data Source** | Riot Developer API exclusively |
 
-The technical stack and why each piece was chosen
-The Python sidecar is FastAPI on uvicorn. Python was chosen because the collector and aggregator pipelines benefit heavily from polars (for the columnar match processing) and DuckDB (for the in-process SQL over parquet), and rewriting either of those in Rust would have been a multi-month project for no user-visible benefit. FastAPI was chosen over Flask/Starlette because its built-in pydantic validation matches the structure of the LCU and Riot API responses well — the same pydantic models that validate inbound request bodies are reused for inbound LCU response parsing, halving the type-definition surface.
-The runtime host is Tauri 2.x in Rust. Tauri was chosen over Electron because the resulting MSI installer is ~30MB rather than ~150MB, the memory footprint is ~80MB rather than ~400MB, and the Windows MSI signing chain is simpler. Tauri's sidecar capability is used to launch and supervise the Python subprocess; the lifecycle is bound to the Tauri window so closing the app cleanly terminates the Python process without orphaned subprocesses.
-The frontend is SolidJS rather than React. SolidJS was chosen for its compile-time reactivity model, which produces a smaller bundle (the production build is ~140KB gzipped vs ~280KB for an equivalent React build) and avoids the runtime VDOM diffing overhead that becomes visible on a ~450px panel that re-renders on every champ-select tick. Tailwind CSS provides the utility classes; @kobalte/core provides the accessibility-correct primitives (dialogs, dropdowns, tabs) without dictating a visual style.
-The match data is stored as Apache Parquet files in data/matches/, partitioned by date and patch. Parquet was chosen over SQLite because polars can scan parquet directly without round-tripping through a SQL engine, and DuckDB can run aggregations across parquet files via its own scanner. The partitioning scheme allows the aggregator to scope its scans to "current patch only" without filtering across millions of rows.
-Network access from the collector uses raw httpx.AsyncClient rather than a higher-level Riot API wrapper (riotwatcher, pulsefire, cassiopeia, pyot). The decision was driven by three considerations: (1) the wrappers' rate-limiter implementations either hardcode quotas that may not match the user's actual production key or have known race conditions under high concurrency, (2) the surface area lolQ uses is small (~five endpoints across league-v4, match-v5, account-v1, and the LCU surface), and (3) maintaining the rate-limiter in-tree means the implementation can react to undocumented Riot edge behavior — like the documented start parameter cap at ~1,000 on matches/by-puuid/{puuid}/ids — without waiting for a wrapper-library release. The implementation is ~150 lines of code and is unit-tested with respx mocking against synthetic Riot responses.
-The frontend communicates with the Python sidecar via two channels: HTTP for request/response (recommendation fetches, account switches, history queries) and a WebSocket for real-time push (LCU state changes, collector progress updates, aggregator completion notifications). The WebSocket uses a JSON-line protocol with a small message-type discriminator; it is not exposed externally and binds only to 127.0.0.1.
+---
 
-What state the code is in
-This README describes the system as it will be at the completion of Phase 12. The current state of the code at the time of this application reflects completed Phases 1 through 10 (Phase 9 ships the working Wilson-ranked recommender, account switcher, and stats dashboard; Phase 10A through 10.6 ship the rune data pipeline, runes editor with LCU apply, and spells editor with LCU apply). Phase 11 (heuristic adaptive layer) is scoped and specified in reports/phase11/ but not yet implemented; Phase 12 (statistical comp-slicing) is scoped in reports/phase12/. Phase 10B (OTP-targeted collector) is implemented and merged, providing the data-collection mechanism that will be needed for rare-champion coverage in Phase 12.
-The application is a personal-use tool. It is not currently distributed publicly, has no other users besides the 11 friends mentioned above, and its development is driven by my own ranked play. The reason for applying for Riot Developer API access is precisely to enable the collector pipeline described above; without a production-tier key, the collector's throughput is bottlenecked at the development-tier limit of 20 requests per second / 100 requests per 2 minutes, which is insufficient to maintain a fresh ~200,000-match local store across patches without the collector lagging behind Riot's data retention horizon.
+## The Problem lolQ Solves
 
-Summary
-lolQ is a locally-running League companion app whose core differentiator is comp-aware build recommendations driven by ~200,000 Master+ EUW matches collected via Riot's Developer API. The system uses a three-layer recommender (Wilson-ranked baseline, heuristic rule overlay, statistical comp-archetype slicing) that produces sensible output at any data-volume level and degrades gracefully on sparse cells. The data pipeline is rate-limit-correct, patch-aware, deduplicated across collector cycles, and stored locally in parquet form. The frontend reads the LCU directly for champ-select state and can write rune pages and summoner spells back to the client on user-initiated apply. The application has no remote backend, no telemetry, no user-data exfiltration, and no in-game functionality; it operates strictly in the pre-game decision phase that Riot has historically supported via the public Developer API.
-The motivation behind it is concrete: 11 of my friends recently started playing the game and were getting punished by static u.gg builds that ignored matchup context — full-armor builds against AP-heavy enemy comps, full-MR builds against AD-heavy comps, the kind of failure that's invisible at high elo because experienced players adjust by reflex but devastating for newcomers who follow the build site literally. lolQ exists to solve that specific problem and make it explicit in the UI why a given recommendation differs from the static average. As a Grandmaster player myself, I'm committed to maintaining the recommender's quality over time through patch-by-patch manual auditing of the hand-curated overrides — the kind of long-term human-in-the-loop maintenance that distinguishes a personal tool kept current by its author from a static dataset that decays each time Riot ships a balance update
+Existing community build sites display recommended builds that are **averaged across all matchups**. This works fine for experienced players who adjust by reflex, but it's a real problem for newer players.
+
+### The Failure Mode
+
+A new tank player checks u.gg for their Ornn/Malphite/Sion build:
+
+```
+Ornn Top Lane (u.gg average across all matchups):
+  Sunfire Aegis → Thornmail → Frozen Heart → Randuin's Omen
+  → ~250 armor, ~60 MR
+```
+
+They follow this build into a game where the enemy team has 3 AP threats and 2 squishy carries. Result: a tank with massive armor and almost no magic resist getting one-shot by Syndra ult or Veigar combo — and they have no idea why, because **the build site told them this was the recommended build.**
+
+### The Fix
+
+lolQ makes enemy team composition a **first-class input** to the recommender:
+
+```
+Ornn Top Lane (lolQ, with enemy comp detected):
+  ┌─────────────────────────────────────────────────┐
+  │ vs 3+ AP                          [data-driven] │
+  ├─────────────────────────────────────────────────┤
+  │ Sunfire Aegis → Force of Nature → Spirit Visage │
+  │                  └─ swap-in for MR              │
+  │                                                 │
+  │ ↑ Force of Nature promoted because enemy has    │
+  │   3+ AP threats (rule: mr_vs_3ap)               │
+  └─────────────────────────────────────────────────┘
+```
+
+The badge at the top tells the user *why* the build differs. This turns a frustrating "the build site lied to me" moment into a transparent "the build adjusted because the enemy team is mostly mages" — useful in the moment and educational over time.
+
+---
+
+## About Me
+
+I am a **Grandmaster-tier ranked Solo/Duo player on EUW**. lolQ started as a personal tool for my own ranked play but expanded when 11 of my friends started playing the game and kept getting punished by the failure mode described above.
+
+### Why I Will Maintain This Over Time
+
+The statistical layer of the recommender (Phase 12) handles automatic updates: when a patch lands and item balance shifts, the aggregator re-runs and the per-archetype builds update themselves from new match data within a few collector cycles.
+
+But statistics alone cannot capture everything. Some build choices are correct only:
+
+- For specific player skill levels (Lethality first-item on Talon is correct at GM but wrong at Gold)
+- In specific matchups the dataset cannot see as distinct (Renekton vs Riven is different from Renekton vs Aatrox even though both are "Fighter top lane")
+- When the player understands a nuance not visible in match data (item timing windows, power spikes around objectives)
+
+These nuances live in **hand-curated overrides** — JSON files under `assets/data/item_sets/`, `rune_sets/`, and `spell_sets/` that the aggregator deliberately leaves untouched when the file's `source` field is anything other than `auto_from_aggregator`.
+
+My plan is to spend time over the months and patches following Phase 12's release **manually auditing** the auto-generated builds for the champions I actively play, comparing them against:
+
+- My own ranked games
+- High-elo VOD analysis
+- Pro-play builds from Worlds/LEC/LCK
+
+…and writing manual overrides where the data-driven build is suboptimal in a way the aggregator cannot detect. This is a **continuous, indefinite maintenance loop** — League's meta shifts every two weeks, and the app's quality depends on a human in the loop who actually plays the game at the level the dataset represents.
+
+---
+
+## Features
+
+### 1. Live Champ-Select Recommendations
+
+When the player enters champion select, lolQ:
+
+1. Detects the LCU lockfile and subscribes to `/lol-champ-select/v1/session` events via WebSocket
+2. Updates its internal model on every pick/ban
+3. Classifies the enemy team into a comp archetype (one of ~8 k-modes clusters)
+4. Looks up `(champion, lane, archetype)` in `builds_by_archetype.parquet`
+5. Falls back hierarchically if the cell is sparse:
+   - `(champion, lane, archetype)` → if < 50 matches
+   - `(champion, lane, *)` → if < 30 matches
+   - Phase 11 heuristic rules → if no data
+
+### 2. LCU Apply Buttons
+
+| Button | LCU Endpoint | What It Does |
+|---|---|---|
+| Apply Runes | `POST /lol-perks/v1/pages` | Writes the recommended rune page directly into the client |
+| Apply Spells | `PATCH /lol-champ-select/v1/session/my-selection` | Sets D/F summoner spells |
+| Cleanup Pages | `DELETE /lol-perks/v1/pages/{id}` | Removes old `lolQ:`-prefixed pages (LRU when slots full) |
+
+All writes are **user-initiated** (button click, never automatic) and all created pages are prefixed with `lolQ:` for auditability.
+
+### 3. Account Switcher
+
+For users with multiple accounts (main + smurfs), keyboard shortcuts `1-9` switch accounts by:
+
+1. Cleanly closing the League Client
+2. Editing the Riot Client's `RiotClientInstalls.json` to point to the selected account
+3. Relaunching the client
+4. Re-attaching the LCU watchdog to the fresh client
+
+**Credentials are stored in the Windows Credential Manager** (via Python `keyring`), never in plain-text files.
+
+### 4. Stats Dashboard
+
+A second route shows the user's own match history:
+
+- Per-champion win rate
+- KDA distribution
+- Build history
+- Lane assignment patterns
+
+Refreshes via `/lol/match/v5/matches/by-puuid/{puuid}/ids` polling every 5 minutes when not in-game.
+
+### 5. Research Mode
+
+A third route lets the user browse build recommendations for any champion-and-lane combo without being in a champ select. Every item, rune, and spell is hover-annotated with sample size and Wilson lower-bound confidence interval.
+
+---
+
+## Architecture
+
+### High-Level Component Diagram
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Tauri Host (Rust)                    │
+│  ┌──────────────────────┐  ┌──────────────────────────┐ │
+│  │  SolidJS Frontend    │  │  Python Sidecar Manager  │ │
+│  │  (TypeScript, Vite)  │  │  (subprocess lifecycle)  │ │
+│  └──────────────────────┘  └──────────────────────────┘ │
+└──────────────┬──────────────────────┬───────────────────┘
+               │ HTTP + WebSocket     │ stdin/stdout
+               │ (localhost only)     │ (process supervision)
+               ▼                      ▼
+       ┌───────────────────────────────────────┐
+       │   FastAPI Sidecar (Python, uvicorn)   │
+       │  ┌─────────────┐  ┌────────────────┐  │
+       │  │  Collector  │  │   Aggregator   │  │
+       │  │  (httpx)    │  │   (DuckDB)     │  │
+       │  └─────────────┘  └────────────────┘  │
+       │  ┌─────────────┐  ┌────────────────┐  │
+       │  │  LCU Client │  │  Recommender   │  │
+       │  │  (httpx)    │  │  (3 layers)    │  │
+       │  └─────────────┘  └────────────────┘  │
+       └───────┬───────────────────┬───────────┘
+               │                   │
+               ▼                   ▼
+        ┌──────────────┐    ┌──────────────────┐
+        │  Riot API    │    │   LCU Lockfile   │
+        │  (TLS, prod) │    │  (localhost)     │
+        └──────────────┘    └──────────────────┘
+```
+
+### Communication
+
+| Channel | Protocol | Purpose |
+|---|---|---|
+| Frontend ↔ Sidecar | HTTP (REST) | Request/response: recommendations, account switches, history queries |
+| Frontend ↔ Sidecar | WebSocket (JSON-line) | Real-time push: LCU state changes, collector progress, aggregator events |
+| Sidecar ↔ Riot API | HTTPS | Match data, league data, account lookups |
+| Sidecar ↔ LCU | HTTPS (self-signed) | Champ-select state, rune-page CRUD, spell apply |
+
+All localhost communication is bound to `127.0.0.1` — never exposed externally.
+
+---
+
+## Data Pipeline
+
+### The Collector
+
+A FastAPI subprocess that pulls match data from Riot's Developer API. Grows the local parquet store from zero to ~200,000 matches over weeks of background operation.
+
+#### Three Phases Per Cycle
+
+**Phase 1 — PUUID Discovery** *(3 API calls total)*
+
+```python
+# Single call per tier — LeagueItemDTO now includes puuid directly
+GET /lol/league/v4/challengerleagues/by-queue/RANKED_SOLO_5x5
+GET /lol/league/v4/grandmasterleagues/by-queue/RANKED_SOLO_5x5
+GET /lol/league/v4/masterleagues/by-queue/RANKED_SOLO_5x5
+```
+
+This yields ~5,000-6,000 EUW Master+ puuids in just 3 calls, thanks to Riot's 2024 schema migration which added `puuid` directly to `LeagueItemDTO`.
+
+**Phase 2 — Match-ID Enumeration**
+
+```python
+for puuid in harvested_puuids:
+    for start in [0, 100, 200, ..., 900]:
+        GET /lol/match/v5/matches/by-puuid/{puuid}/ids
+            ?queue=420&type=ranked&count=100&start={start}
+```
+
+Hard cap: `start <= 1000` (Riot returns empty array beyond that).
+
+**Phase 3 — Match-Detail Fetch**
+
+```python
+new_ids = harvested_ids - seen_match_ids  # DuckDB-backed dedup
+for match_id in new_ids:
+    GET /lol/match/v5/matches/{match_id}
+    # parse into flat participant-row format (10 rows per match)
+    # append to data/matches/{patch}/{date}/batch_{n}.parquet
+```
+
+### Rate Limiting
+
+Header-driven, not hardcoded:
+
+| Header | Used For |
+|---|---|
+| `X-App-Rate-Limit` | App-level quota (typically 500/10s + 30000/10min) |
+| `X-App-Rate-Limit-Count` | Current usage in each window |
+| `X-Method-Rate-Limit` | Per-endpoint quota |
+| `X-Method-Rate-Limit-Count` | Per-endpoint usage |
+| `Retry-After` (on 429) | Exact sleep duration in seconds |
+| `X-Rate-Limit-Type` (on 429) | Which limit was exceeded (app/method/service) |
+
+#### Key Behaviors
+
+- Burst allowed up to **95%** of published quota (5% headroom for window-boundary jitter per developer-relations Issue #371)
+- **Two separate limiters**: one for `euw1.api.riotgames.com`, one for `europe.api.riotgames.com` (independent buckets per Riot's per-region enforcement)
+- On 429: sleep exactly `Retry-After` + 100-500ms jitter, **no exponential backoff** (Riot's value is authoritative)
+- Exponential backoff reserved only for 500/502/503/504
+
+#### Pseudocode
+
+```python
+class RiotLimiter:
+    def __init__(self, host: str):
+        self.host = host
+        self.app_buckets: list[FixedWindow] = []
+        self.method_buckets: dict[str, list[FixedWindow]] = {}
+    
+    async def acquire(self, method: str) -> None:
+        await self._wait_for_capacity(method)
+    
+    def update_from_headers(self, headers: dict, method: str) -> None:
+        self._parse_app_limits(headers)
+        self._parse_method_limits(headers, method)
+    
+    async def handle_429(self, response: Response) -> float:
+        retry_after = int(response.headers["Retry-After"])
+        limit_type = response.headers["X-Rate-Limit-Type"]
+        jitter = random.uniform(0.1, 0.5)
+        return retry_after + jitter
+```
+
+### Connection Pooling
+
+```python
+client = httpx.AsyncClient(
+    limits=httpx.Limits(
+        max_connections=50,
+        max_keepalive_connections=25,
+        keepalive_expiry=30.0,
+    ),
+    timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0),
+)
+# Single long-lived client — NOT one per request
+```
+
+Concurrency bounded by `asyncio.Semaphore(25)` — sufficient to saturate the 500/10s cap at ~45-48 req/s sustained throughput.
+
+### OTP-Targeted Collector
+
+For rare champions (Bard, Aurelion Sol, Ivern, Mel, Briar), random sampling is too slow. The OTP collector targets known high-elo one-trick-pony players:
+
+```bash
+uv run python -m scripts.collect_otp \
+    --champion bard \
+    --riot-ids "Player1#EUW,Player2#EUW,Player3#EUW" \
+    --max-per-player 1000
+```
+
+**Yield comparison:**
+
+| Approach | Bard matches in 10 min |
+|---|---|
+| Random Master+ sampling | ~5-15 (Bard pickrate <1%) |
+| 5 Bard OTPs (~80% pickrate each) | ~4,000-5,000 |
+
+OTP data is written to a separate path (`data/matches/otp_curated/<champion>/`) with extra columns:
+
+| Column | Purpose |
+|---|---|
+| `data_source` | Always `"otp_curated"` for OTP rows, distinguishes from random pool |
+| `source_puuid` | Which OTP this match came from (for skill-weighting later) |
+| `otp_riot_id` | Human-readable Riot ID for debugging |
+
+The recommender treats OTP-curated as a **separate candidate pool** to prevent skill-ceiling inflation when mixed with random samples.
+
+### The Aggregator
+
+DuckDB-based pipeline that produces seven output parquets:
+
+| Output | Key | Purpose |
+|---|---|---|
+| `champion_winrate.parquet` | (champion, role, tier, patch) | Overall champion win rate |
+| `item_winrate.parquet` | (champion, role, item_id) | Per-item win rate — fixes sparsity issue of old `item_build_winrate` |
+| `rune_winrate.parquet` | (champion, role, rune_id, slot) | Per-slot rune win rate |
+| `summoner_spell_winrate.parquet` | (champion, role, spell1, spell2) | Spell combo win rate |
+| `matchup_table.parquet` | (champion, role, opponent_champion) | 1v1 matchup table |
+| `build_transitions.parquet` | (champion, role, item_n, item_n+1) | Markov model over item order |
+| `builds_by_archetype.parquet` | (champion, role, archetype, item_slot, item_id) | **Phase 12 artifact** — comp-aware builds |
+
+#### Bayesian Smoothing
+
+Every win-rate cell stores both:
+
+- Raw fraction: `wins / games`
+- Bayesian-smoothed estimate
+
+Smoothing uses an empirical-Bayes Beta prior:
+
+```python
+# Prior mean = global (champion, lane) win rate
+# Prior strength α + β = 50 effective games
+wr_smoothed = (wins + α) / (games + α + β)
+
+# Wilson lower bound at 95% CI also stored
+wilson_lb = wilson_score_interval(wins, games, confidence=0.95).lower
+```
+
+**Recommender ranks by Wilson lower bound**, not raw win rate — intrinsic protection against high-variance recommendations from small samples.
+
+---
+
+## The Recommender Stack
+
+Three layers that escalate in sophistication:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Phase 12: Statistical Comp-Slicing                      │
+│   Per-(champion, lane, enemy_archetype) builds          │
+│   Active when cell has ≥50 matches                      │
+├─────────────────────────────────────────────────────────┤
+│ Phase 11: Heuristic Adaptive Rules                      │
+│   30-60 hand-curated rules in rules.toml                │
+│   Fallback when Phase 12 cell is sparse                 │
+├─────────────────────────────────────────────────────────┤
+│ Phase 9: Wilson-Ranked Baseline                         │
+│   Best build per (champion, role) by Wilson LB          │
+│   Always-available foundation                           │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Phase 9: Wilson-Ranked Baseline (foundation, ships first)
+
+```python
+def recommend_base(champion: str, role: str) -> Build:
+    rows = duckdb.query(f"""
+        SELECT item_combo, wins, games, 
+               wilson_lower_bound(wins, games) as lb
+        FROM item_build_winrate
+        WHERE champion = '{champion}' AND role = '{role}'
+        ORDER BY lb DESC LIMIT 1
+    """).fetchone()
+    return Build.from_row(rows)
+```
+
+Deterministic, fully interpretable. Works at zero data via hand-curated overrides in `assets/data/item_sets/*.json`.
+
+### Phase 11: Heuristic Adaptive Layer
+
+Rules engine reads from a single `rules.toml`:
+
+```toml
+[[rule]]
+id = "mr_vs_3ap"
+condition = "enemy_tags_count(['Mage']) >= 3"
+items_promote = [4644, 6655, 4401]   # Hexdrinker, Banshee's, Force of Nature
+items_demote = [3047, 3110]          # Plated Steelcaps, Frozen Heart
+priority_shift = 2
+weight = 0.20
+description_de = "Gegner hat 3+ AP — MR-Items priorisieren"
+```
+
+Every triggered rule is returned in the API response so the frontend can render a "why" tooltip on each modified item. **Interpretability is non-negotiable** — this is what differentiates lolQ from black-box ML recommenders.
+
+### Phase 12: Statistical Comp-Slicing (the main differentiator)
+
+#### Enemy Comp Encoding
+
+```python
+# Per-match feature extraction
+features = {
+    "tank_count": count_tags(enemy_team, "Tank"),
+    "ap_count":   count_tags(enemy_team, "Mage"),
+    "ranged_count": count_ranged(enemy_team),
+    "cc_score":   calculate_cc_score(enemy_team),
+}
+
+# Cluster via k-modes (categorical k-means variant)
+archetype_id = kmodes_predict(features, persisted_centroids)
+# → one of ~6-12 stable clusters
+```
+
+#### Recommendation
+
+```python
+def recommend_adaptive(champion, role, enemy_team) -> Build:
+    archetype = encode_comp(enemy_team)
+    
+    # Try most specific cell first
+    cell = lookup_cell(champion, role, archetype)
+    if cell.games >= 50:
+        return cell.build_from_wilson_lb(), source="data-driven"
+    
+    # Fall back to less-specific
+    cell = lookup_cell(champion, role, archetype="*")
+    if cell.games >= 30:
+        # Apply Phase 11 rules on top of base build
+        base = cell.build_from_wilson_lb()
+        return apply_heuristic_rules(base, enemy_team), source="heuristic"
+    
+    # Last resort: hand-curated
+    return load_curated(champion, role), source="baseline"
+```
+
+The UI shows the source as a small badge: `[data-driven]`, `[heuristic]`, or `[baseline]`.
+
+### Comparison to Existing Tools
+
+| Tool | Champion+Lane | vs 1 Opponent | vs Full Comp |
+|---|---|---|---|
+| u.gg | ✅ | ✅ (single) | ❌ |
+| op.gg | ✅ | ✅ (single) | ❌ |
+| lolalytics | ✅ | ✅ (single, pairwise) | ❌ |
+| mobalytics | ✅ | ✅ (single) | ❌ |
+| blitz.gg | ✅ | ❌ | ❌ |
+| probuilds.net | ✅ | ❌ | ❌ |
+| **lolQ (Phase 12)** | ✅ | ✅ | ✅ **(8 archetypes)** |
+
+---
+
+## Riot API Usage
+
+### Endpoints Used
+
+| Endpoint | Purpose | Host |
+|---|---|---|
+| `/lol/league/v4/challengerleagues/by-queue/{queue}` | PUUID discovery | `euw1.api.riotgames.com` |
+| `/lol/league/v4/grandmasterleagues/by-queue/{queue}` | PUUID discovery | `euw1.api.riotgames.com` |
+| `/lol/league/v4/masterleagues/by-queue/{queue}` | PUUID discovery | `euw1.api.riotgames.com` |
+| `/lol/match/v5/matches/by-puuid/{puuid}/ids` | Match enumeration | `europe.api.riotgames.com` |
+| `/lol/match/v5/matches/{matchId}` | Match details | `europe.api.riotgames.com` |
+| `/riot/account/v1/accounts/by-riot-id/{name}/{tag}` | OTP resolution | `europe.api.riotgames.com` |
+
+### Endpoints **Not** Used
+
+| Endpoint | Why Not |
+|---|---|
+| Live Client Data API (port 2999) | In-game data is **out of scope** — lolQ is champ-select-only |
+| Spectator API | Not used |
+| Tournament API | Not used |
+| Champion Mastery | Could be added but not currently needed |
+
+### Throughput Budget
+
+With a Production-tier key (500 req/10s, 30,000 req/10min):
+
+| Workload | Estimated Throughput | Time to 200k matches |
+|---|---|---|
+| Steady-state collection | ~45-48 req/s sustained | ~6-8 weeks of background operation |
+| Catch-up after downtime | ~50 req/s peak | ~1-2 days for 100k backlog |
+
+---
+
+## Compliance & Developer Policies
+
+### LCU Writes Policy
+
+lolQ writes to two LCU endpoints:
+
+| Endpoint | Purpose | Safety Properties |
+|---|---|---|
+| `POST /lol-perks/v1/pages` | Apply rune page | User-initiated, prefixed `lolQ:`, reversible |
+| `PATCH /lol-champ-select/v1/session/my-selection` | Set summoner spells | User-initiated, only during PLANNING phase |
+
+These are documented LCU endpoints used by mainstream tools (Mobalytics, Blitz, OP.GG Desktop, Porofessor) for the same purpose without enforcement action over multiple years. The app's writes are:
+
+- ✅ **User-initiated** (button click, never automatic)
+- ✅ **Reversible** (cleanup function removes all `lolQ:` pages)
+- ✅ **Auditable** (all created pages prefixed for identification)
+- ✅ **Scoped** (no other LCU resources touched — no friend-list, chat, match-history, in-game state)
+
+### Data Collection Policy
+
+- ✅ **Riot API exclusively** — no scraping of u.gg, lolalytics, op.gg, etc.
+- ✅ **No reverse-engineering** — no game-client memory inspection, packet capture, or undocumented endpoints
+- ✅ **Anonymized at storage** — PUUIDs are stored but never associated with any external identifier in the local DB
+
+### Competitive Integrity Policy
+
+- ✅ **Pre-game only** — app provides champ-select recommendations exclusively
+- ✅ **No in-game overlay** — no minimap awareness, no DPS calc, no cooldown tracker
+- ✅ **No real-time advantage** — every recommendation is statistical, based on historical data, with no live-game data feed
+
+### Rate-Limit Respect
+
+- ✅ Header-driven implementation (not hardcoded quotas)
+- ✅ Operates at ≤95% of published quota
+- ✅ Single API key per user, no multi-key evasion
+- ✅ Refuses to start collector on missing/revoked key (401/403 fail-fast)
+
+### Account-Switcher Safety
+
+- ✅ Credentials in Windows Credential Manager (Windows-native secret store)
+- ✅ Uses Riot's own `RiotClientInstalls.json` mechanism
+- ✅ No session-token storage, no login-dialog scripting
+- ✅ Does not facilitate account sharing/selling
+
+---
+
+## Technical Stack
+
+### Stack Choices
+
+| Layer | Technology | Why |
+|---|---|---|
+| Backend | Python 3.12 + FastAPI + uvicorn | polars + DuckDB ecosystem for data processing |
+| Runtime Host | Tauri 2.x (Rust) | ~30MB MSI vs ~150MB Electron, ~80MB RAM vs ~400MB |
+| Frontend | SolidJS + Vite + TypeScript | ~140KB gzipped (vs ~280KB React), compile-time reactivity |
+| UI Components | @kobalte/core + Tailwind CSS | Accessibility primitives without prescribing visual style |
+| Match Storage | Apache Parquet (date/patch partitioned) | Columnar, polars-native, DuckDB-scannable |
+| Aggregation | DuckDB (in-process) | SQL over parquet without round-tripping through a DB server |
+| HTTP Client | httpx async (raw) | Smaller surface than wrappers, custom rate-limiter |
+| Credentials | Python `keyring` → Windows Credential Manager | Windows-native, encrypted at rest |
+| Build | pnpm + uv + cargo | Modern, fast, reproducible |
+
+### Why Raw `httpx` Instead of a Wrapper
+
+I evaluated `riotwatcher`, `pulsefire`, `cassiopeia`, and `pyot`. None were chosen because:
+
+1. **Hardcoded rate limits** — most wrappers don't read `X-Method-Rate-Limit` dynamically, instead hardcoding quotas that may not match a production key
+2. **Race conditions** — RiotWatcher's own docs warn: *"In a multithreaded environment, you may still get some 429 errors"*
+3. **Small API surface** — lolQ uses ~6 endpoints; a wrapper is overhead, not value
+4. **Edge-case maintenance** — wrappers don't always track Riot's undocumented quirks (e.g., the `start <= 1000` cap on matchlist pagination)
+
+The in-tree rate-limiter is ~150 lines of code, unit-tested with `respx` mocking, and updates dynamically from response headers on every request.
+
+---
+
+## Project State & Roadmap
+
+### Completed Phases
+
+| Phase | Description | Status |
+|---|---|---|
+| 1–8 | Foundation: Tauri sidecar, collector, aggregator, MSI build | ✅ Complete |
+| 9 | Account-switcher, stats dashboard, Wilson-ranked recommender, 20k collector run | ✅ Complete |
+| 10A | Rune data pipeline + parser extension (9 perk fields per match) | ✅ Complete |
+| 10.5 | Runes Editor UI + LCU apply | ✅ Complete |
+| 10.6 | Spells Editor UI + LCU apply | ⏳ In progress |
+| 10B | OTP-Targeted Collector | ✅ Complete |
+
+### Upcoming Phases
+
+| Phase | Description | ETA | Required Data |
+|---|---|---|---|
+| 10.5.1 | Rune-generator bug-fix (slot-aware Wilson) | This week | None |
+| 10.7 | Per-item winrate aggregation fix | This week | None |
+| 11 | Heuristic Adaptive Rules (30-60 rules) | Next weekend | Current 14k matches sufficient |
+| 12 | **Statistical Comp-Slicing** | ~2-3 months | ~200k matches needed |
+| 13 | (Optional) ML Hybrid with Word2Vec embeddings | ~6 months | ~300k matches needed |
+
+---
+
+## Why I Need a Production API Key
+
+### Development Key Limitations
+
+| Limit | Development Key | Production Key |
+|---|---|---|
+| App limit (10s) | 20 req/s | 500 req/s |
+| App limit (10min) | 100 req | 30,000 req |
+| Expiration | Every 24h | Renewable annually |
+| Suitable for | Prototyping | Sustained data collection |
+
+### Throughput Required for Phase 12
+
+To reach ~200,000 matches and maintain it across patches:
+
+- **Patch cadence**: ~2 weeks
+- **Match retention** (Riot's): ~2 years details, ~1 year timelines
+- **Required collection rate**: ~10,000-15,000 matches per week to stay ahead of retention horizon
+- **At dev-key rate**: ~864 matches/day max → ~6,000/week → **collector lags behind retention**
+- **At production rate**: ~30,000+ matches/day possible → keeps store current
+
+Without a production-tier key, Phase 12 (the core differentiator described in this entire README) is not achievable. The collector would fall behind Riot's data retention before reaching the sample size needed for stable per-archetype recommendations.
+
+### Commitment
+
+This is a personal-use tool maintained by an active Grandmaster player. It will continue to be maintained as long as I play League, which based on my history is likely indefinite. The code is version-controlled and the architecture is designed for continuous, patch-by-patch updates — both statistical (automated via aggregator) and manual (via hand-curated overrides).
+
+---
+
+## Contact
+
+This README is part of the application materials for the Riot Developer API Production tier.
+
+**Project**: lolQ
+**Author**: Chris (Grandmaster EUW)
+**Use case**: Personal-use companion app for ~12 users (myself + 11 friends)
+**Repository**: (private at the time of application)
+
+---
+
+*Built locally. Stays locally. No telemetry, no analytics, no remote backend. Just better builds.*
