@@ -644,7 +644,7 @@ This is a personal-use tool maintained by an active Grandmaster player. It will 
 This README is part of the application materials for the Riot Developer API Production tier.
 
 **Project**: lolQ
-**Author**: Chris (Grandmaster EUW)
+**Author**: Cedric (Grandmaster EUW)
 **Use case**: Personal-use companion app for ~12 users (myself + 11 friends)
 **Repository**: (private at the time of application)
 
